@@ -1,0 +1,130 @@
+# Cloud Build — build backend image and deploy to GKE
+#
+# Required substitution variables:
+#   _GKE_CLUSTER  : GKE cluster name    (e.g. gemini-live-cluster)
+#   _GKE_REGION   : GKE cluster region  (e.g. us-central1)
+#
+# Set in the Cloud Build trigger UI or pass with:
+#   gcloud builds submit \
+#     --config cloudbuild.yaml \
+#     --substitutions _GKE_CLUSTER=gemini-live-cluster,_GKE_REGION=us-central1 .
+#
+# Cloud Build SA needs:
+#   roles/container.developer   — kubectl access to GKE
+#   roles/storage.admin         — push images to GCR
+
+substitutions:
+  _GKE_CLUSTER: gemini-live-cluster
+  _GKE_REGION: us-central1
+  _IMAGE: gcr.io/$PROJECT_ID/geminilive-glive
+  _TAG: latest
+
+steps:
+  # ── 1. Build the backend container image ────────────────────────────────────
+  - id: build-image
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - $_IMAGE:$_TAG
+      - -t
+      - $_IMAGE:latest
+      - ./backend
+
+  # ── 2. Push to Container Registry ───────────────────────────────────────────
+  - id: push-image
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - $_IMAGE
+    waitFor: [build-image]
+
+  # ── 3. Inject project ID into deployment manifest ───────────────────────────
+  # Replaces the YOUR_PROJECT_ID placeholder so the image reference is valid
+  # when the Deployment is first applied.  Step 5 (set-image) then pins it to
+  # the exact commit SHA.
+  - id: prepare-manifests
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        sed -i "s|gcr.io/YOUR_PROJECT_ID/geminilive-glive|gcr.io/$PROJECT_ID/geminilive-glive|g" \
+          k8s/deployment.yaml
+    waitFor: [push-image]
+
+  # ── 4. Apply namespace, ServiceAccount, ConfigMap, Service, Ingress ─────────
+  - id: apply-manifests
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: kubectl
+    args:
+      - apply
+      - -f
+      - k8s/namespace.yaml
+      - -f
+      - k8s/serviceaccount.yaml
+      - -f
+      - k8s/configmap.yaml
+      - -f
+      - k8s/service.yaml
+      - -f
+      - k8s/ingress.yaml
+    env:
+      - CLOUDSDK_COMPUTE_REGION=$_GKE_REGION
+      - CLOUDSDK_CONTAINER_CLUSTER=$_GKE_CLUSTER
+    waitFor: [prepare-manifests]
+
+  # ── 5. Apply Deployment ──────────────────────────────────────────────────────
+  - id: deploy-backend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: kubectl
+    args:
+      - apply
+      - -f
+      - k8s/deployment.yaml
+    env:
+      - CLOUDSDK_COMPUTE_REGION=$_GKE_REGION
+      - CLOUDSDK_CONTAINER_CLUSTER=$_GKE_CLUSTER
+    waitFor: [apply-manifests]
+
+  # ── 6. Pin Deployment image to the build tag ────────────────────────────────
+  - id: set-image
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: kubectl
+    args:
+      - set
+      - image
+      - deployment/gemini-live-backend
+      - backend=$_IMAGE:$_TAG
+      - -n
+      - gemini-live
+    env:
+      - CLOUDSDK_COMPUTE_REGION=$_GKE_REGION
+      - CLOUDSDK_CONTAINER_CLUSTER=$_GKE_CLUSTER
+    waitFor: [deploy-backend]
+
+  # ── 7. Wait for rollout to complete ─────────────────────────────────────────
+  - id: rollout-status
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: kubectl
+    args:
+      - rollout
+      - status
+      - deployment/gemini-live-backend
+      - -n
+      - gemini-live
+      - --timeout=300s
+    env:
+      - CLOUDSDK_COMPUTE_REGION=$_GKE_REGION
+      - CLOUDSDK_CONTAINER_CLUSTER=$_GKE_CLUSTER
+    waitFor: [set-image]
+
+images:
+  - $_IMAGE:$_TAG
+  - $_IMAGE:latest
+
+timeout: '1800s'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

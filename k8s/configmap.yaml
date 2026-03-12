@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gemini-live-config
+  namespace: gemini-live
+data:
+  # ── Google Cloud ──────────────────────────────────────────────────────────
+  PROJECT_ID: "general-ak"
+  LOCATION: "us-central1"
+
+  # ── Vertex AI Live API ────────────────────────────────────────────────────
+  GOOGLE_GENAI_USE_VERTEXAI: "TRUE"
+  GOOGLE_CLOUD_PROJECT: "general-ak"
+  GOOGLE_CLOUD_LOCATION: "us-central1"
+
+  # ── Vertex AI RAG Corpus ──────────────────────────────────────────────────
+  # Numeric ID only — full path is built by config.py.
+  RAG_CORPUS_ID: "6917529027641081856"
+
+  # ── Agent Model ───────────────────────────────────────────────────────────
+  DEMO_AGENT_MODEL: "gemini-live-2.5-flash-native-audio"
+
+  # ── GCS Transcript Storage ────────────────────────────────────────────────
+  GCS_RECORDINGS_BUCKET: "mofsl-contact-center-recordings"
+
+  # ── Server ────────────────────────────────────────────────────────────────
+  PORT: "8080"
+  HOST: "0.0.0.0"
+
+  # ── Exotel Integration ────────────────────────────────────────────────────
+  # Update to the external IP or domain after the LoadBalancer is provisioned.
+  # Example: BACKEND_WS_URL: "wss://34.x.x.x"
+  BACKEND_WS_URL: ""

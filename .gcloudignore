@@ -1,0 +1,44 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Secret files — never upload to Cloud Build source archive
+.env
+**/.env
+backend/.env
+__pycache__/
+*.pyc
+*.pyo
+
+# Node.js
+node_modules/
+.npm/
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Old/backup files
+old_architecture_backup_*/
+agents/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
