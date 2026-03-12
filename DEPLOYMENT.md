@@ -450,3 +450,4 @@ kubectl rollout status deployment/gemini-live-backend -n gemini-live
 | TLS cert not provisioning | DNS A record may not have propagated; can take up to 60 min |
 | Cold start on first call | Ensure HPA `minReplicas: 1`; pod should always be running |
 | `gke-gcloud-auth-plugin` not found / not executable | Standalone SDK: `gcloud components install gke-gcloud-auth-plugin`. Apt/Debian/Ubuntu: `sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin`. Then re-run deploy.sh |
+| `kubectl` times out / `connection timed out` to a private IP | Your cluster has a private control plane. Run deploy.sh from **Cloud Shell** (inside Google's network), or add your IP to Master Authorized Networks: `MY_IP=$(curl -s https://checkip.amazonaws.com) && gcloud container clusters update CLUSTER --region=REGION --enable-master-authorized-networks --master-authorized-networks="${MY_IP}/32"` |

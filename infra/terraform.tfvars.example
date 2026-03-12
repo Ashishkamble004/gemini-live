@@ -1,0 +1,45 @@
+# =============================================================================
+# terraform.tfvars.example
+#
+# Copy this file to terraform.tfvars and fill in your values.
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# terraform.tfvars is gitignored — never commit real values.
+# =============================================================================
+
+# ── Required ──────────────────────────────────────────────────────────────────
+
+project_id      = "your-gcp-project-id"
+gcs_bucket_name = "mofsl-contact-center-recordings"
+rag_corpus_id   = "6917529027641081856"   # Vertex AI RAG corpus numeric ID
+
+# ── Optional — change only if you need non-default values ─────────────────────
+
+region       = "us-central1"
+cluster_name = "gemini-live-cluster"
+agent_model  = "gemini-live-2.5-flash-native-audio"
+
+# Leave domain empty to use the static IP directly (no TLS cert provisioned).
+# Set to your FQDN to enable Google-managed TLS on the GKE Ingress.
+domain = ""   # e.g. "ak-demos.com"
+
+# ── Networking — leave as "default" to use the project default VPC ────────────
+#
+# To use a custom VPC:
+#   1. Set network to the VPC name (e.g. "gemini-live-vpc")
+#   2. Set subnetwork to the subnet name in the same region (e.g. "gemini-live-subnet")
+#   3. The subnet must have at least two secondary IP ranges for GKE pods/services;
+#      create it first with:
+#        gcloud compute networks subnets create gemini-live-subnet \
+#          --network=gemini-live-vpc --region=us-central1 --range=10.0.0.0/20 \
+#          --secondary-range=pods=10.4.0.0/14,services=10.0.32.0/20
+#
+network    = "default"
+subnetwork = "default"
+
+# ── Advanced — rarely need changing ───────────────────────────────────────────
+
+gcp_sa_name    = "gemini-live-backend"
+ksa_namespace  = "gemini-live"
+ksa_name       = "gemini-live-sa"
+static_ip_name = "gemini-live-ip"

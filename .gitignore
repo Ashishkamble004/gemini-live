@@ -41,3 +41,10 @@ logs/
 node_modules/
 dist-ssr/
 *.local
+
+# Terraform — state files contain secrets; never commit them
+infra/.terraform/
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+infra/terraform.tfvars
+infra/*.auto.tfvars

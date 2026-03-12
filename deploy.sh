@@ -110,6 +110,11 @@ ask RAG_CORPUS_ID  "Vertex AI RAG Corpus ID"          "6917529027641081856"
 ask GCS_BUCKET     "GCS Bucket (transcripts)"         "mofsl-contact-center-recordings"
 ask AGENT_MODEL    "Gemini Live model"                "gemini-live-2.5-flash-native-audio"
 
+echo ""
+echo -e "  ${CYAN}VPC Network (press Enter to use the 'default' network)${RESET}"
+ask VPC_NETWORK  "VPC network name     (blank = default)" ""
+ask VPC_SUBNET   "VPC subnetwork name  (blank = default)" ""
+
 # ── Derived constants ──────────────────────────────────────────────────────────
 GCP_SA_NAME="gemini-live-backend"
 GCP_SA_EMAIL="${GCP_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -125,6 +130,8 @@ echo -e "  ${BOLD}Summary${RESET}"
 hr
 echo -e "  Project ID     :  ${PROJECT_ID}"
 echo -e "  GKE Cluster    :  ${CLUSTER_NAME}  (${REGION})"
+echo -e "  VPC Network    :  ${VPC_NETWORK:-"default"}"
+echo -e "  VPC Subnetwork :  ${VPC_SUBNET:-"default"}"
 echo -e "  Container      :  ${IMAGE}:latest"
 echo -e "  Domain         :  ${DOMAIN:-"(none — BACKEND_WS_URL must be set manually)"}"
 echo -e "  RAG Corpus     :  ${RAG_CORPUS_ID}"
@@ -241,9 +248,22 @@ if gcloud container clusters describe "$CLUSTER_NAME" \
   info "Cluster already exists"
 else
   echo "  Creating GKE Autopilot cluster — this may take a few minutes..."
+
+  # Build optional network flags — only passed when user specified a custom VPC
+  CLUSTER_EXTRA_FLAGS=()
+  if [[ -n "${VPC_NETWORK}" ]]; then
+    CLUSTER_EXTRA_FLAGS+=("--network=${VPC_NETWORK}")
+    info "Using VPC network: ${VPC_NETWORK}"
+  fi
+  if [[ -n "${VPC_SUBNET}" ]]; then
+    CLUSTER_EXTRA_FLAGS+=("--subnetwork=${VPC_SUBNET}")
+    info "Using subnetwork: ${VPC_SUBNET}"
+  fi
+
   gcloud container clusters create-auto "$CLUSTER_NAME" \
     --region="$REGION" \
     --project="$PROJECT_ID" \
+    "${CLUSTER_EXTRA_FLAGS[@]}" \
     --quiet
   info "Cluster created"
 fi

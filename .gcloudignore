@@ -35,6 +35,9 @@ build/
 old_architecture_backup_*/
 agents/
 
+# Terraform infra — not needed in Cloud Build source archive
+infra/
+
 # Logs
 *.log
 logs/
