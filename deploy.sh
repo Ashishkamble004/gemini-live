@@ -6,22 +6,23 @@
 # Run from the repository root:  ./deploy.sh
 #
 # Prerequisites (must be installed and authenticated):
-#   - gcloud  (authenticated: gcloud auth login)
-#             kubectl is installed automatically via gcloud components if missing
+#   - gcloud  (gcloud auth login && gcloud auth configure-docker)
+#   - kubectl (automatically configured by gcloud after cluster creation)
 #
 # This script will:
 #   1. Enable required GCP APIs
-#   2. Create the GKE cluster if it does not exist (Workload Identity enabled)
-#   3. Create the GCP service account if it does not exist
-#   4. Grant required IAM roles (condition=None)
-#   5. Bind Workload Identity (condition=None)
-#   6. Grant the Cloud Build SA permissions to deploy to GKE
-#   7. Create the GCS transcript bucket if it does not exist
-#   8. Update all configuration files with your values
-#   9. Submit Cloud Build (builds image, pushes to GCR, deploys to GKE)
-#  10. Reserve global static IP + configure Ingress domain
-#  11. Submit Cloud Build (builds image, pushes to GCR, deploys to GKE)
-#  12. Patch BACKEND_WS_URL with your domain; display DNS setup instructions
+#   2. Create the GCP service account if it does not exist
+#   3. Grant required IAM roles to the service account
+#   4. Grant the Cloud Build SA permissions to build and update GKE workloads
+#   5. Create the GCS transcript bucket if it does not exist
+#   6. Reserve a global static IP for the Ingress
+#   7. Create a GKE Autopilot cluster if it does not exist
+#   8. Configure Workload Identity (bind KSA to GSA)
+#   9. Build the container image with Cloud Build and push to GCR
+#  10. Apply all Kubernetes manifests (namespace, SA, configmap, deployment,
+#      service, ingress) with project-specific values substituted
+#  11. Wait for the Deployment rollout to complete
+#  12. Set BACKEND_WS_URL in the ConfigMap and restart the Deployment
 # =============================================================================
 
 set -euo pipefail
@@ -43,40 +44,18 @@ error() { echo -e "\n${RED}✗ ERROR:${RESET} $*\n" >&2; exit 1; }
 step()  { echo -e "\n${CYAN}${BOLD}▶ $*${RESET}"; }
 hr()    { echo -e "${BOLD}──────────────────────────────────────────────────${RESET}"; }
 
-# ── Prerequisite check ─────────────────────────────────────────────────────────
-command -v gcloud &>/dev/null || error "'gcloud' not found. Install the Google Cloud SDK: https://cloud.google.com/sdk/docs/install"
-command -v sed    &>/dev/null || error "'sed' not found."
+# ── Prerequisite checks ────────────────────────────────────────────────────────
+command -v gcloud &>/dev/null || error "'gcloud' not found. Install the Google Cloud SDK."
+command -v kubectl &>/dev/null || error "'kubectl' not found. Install it: gcloud components install kubectl"
 
 gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null \
   | grep -q "." \
   || error "No active gcloud account. Run: gcloud auth login"
 
-# kubectl — try multiple install paths then give up gracefully
-if ! command -v kubectl &>/dev/null; then
-  echo -e "  ${YELLOW}⚠${RESET}  kubectl not found — trying gcloud components..."
-  if gcloud components install kubectl --quiet 2>/dev/null && command -v kubectl &>/dev/null; then
-    info "kubectl installed via gcloud components"
-  else
-    echo -e "  ${YELLOW}⚠${RESET}  gcloud components unavailable — trying apt-get..."
-    if command -v apt-get &>/dev/null \
-        && sudo apt-get install -y kubectl > /dev/null 2>&1 \
-        && command -v kubectl &>/dev/null; then
-      info "kubectl installed via apt-get"
-    else
-      error "kubectl not found and could not be installed automatically.\n"\
-            "  Install it manually, then re-run:\n"\
-            "    apt/deb:  sudo apt-get install -y kubectl\n"\
-            "    snap:     sudo snap install kubectl --classic\n"\
-            "    brew:     brew install kubectl\n"\
-            "    gcloud:   gcloud components install kubectl"
-    fi
-  fi
-fi
-
 # ── Banner ─────────────────────────────────────────────────────────────────────
 echo ""
 hr
-echo -e "  ${BOLD}Gemini Live — MOFSL Contact Center  |  Deployment Setup${RESET}"
+echo -e "  ${BOLD}Gemini Live — MOFSL Contact Center  |  GKE Deployment${RESET}"
 hr
 echo ""
 echo "  This script automates the full GKE deployment."
@@ -94,37 +73,34 @@ ask() {
   printf -v "$var" '%s' "${_input:-$default}"
 }
 
-ask PROJECT_ID    "GCP Project ID"                   "general-ak"
-ask CLUSTER       "GKE Cluster name"                 "gemini-live-cluster"
-ask REGION        "GKE Region"                       "us-central1"
-ask RAG_CORPUS_ID "Vertex AI RAG Corpus ID"          "6917529027641081856"
-ask GCS_BUCKET    "GCS Bucket (transcripts)"         "mofsl-contact-center-recordings"
-ask AGENT_MODEL      "Gemini Live model"                "gemini-live-2.5-flash-native-audio"
-ask DOMAIN           "Domain name (e.g. gemini.your-company.com)"  ""
-ask STATIC_IP_NAME   "GCP global static IP resource name"          "gemini-live-ip"
-
-# ── Validate required inputs ──────────────────────────────────────────────────
-[[ -z "${DOMAIN:-}" ]] && error "Domain name is required for GKE Ingress + TLS.\n  Point an A record at the static IP, then re-run."
+ask PROJECT_ID     "GCP Project ID"                   "general-ak"
+ask CLUSTER_NAME   "GKE cluster name"                 "gemini-live-cluster"
+ask REGION         "GCP Region"                       "us-central1"
+ask DOMAIN         "Domain for TLS (leave blank to skip TLS)" ""
+ask RAG_CORPUS_ID  "Vertex AI RAG Corpus ID"          "6917529027641081856"
+ask GCS_BUCKET     "GCS Bucket (transcripts)"         "mofsl-contact-center-recordings"
+ask AGENT_MODEL    "Gemini Live model"                "gemini-live-2.5-flash-native-audio"
 
 # ── Derived constants ──────────────────────────────────────────────────────────
 GCP_SA_NAME="gemini-live-backend"
 GCP_SA_EMAIL="${GCP_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-GKE_NAMESPACE="gemini-live"
-K8S_SA_NAME="gemini-live-sa"
 IMAGE="gcr.io/${PROJECT_ID}/geminilive-glive"
+STATIC_IP_NAME="gemini-live-ip"
+KSA_NAMESPACE="gemini-live"
+KSA_NAME="gemini-live-sa"
 
+# ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 hr
 echo -e "  ${BOLD}Summary${RESET}"
 hr
-echo -e "  Project ID   :  ${PROJECT_ID}"
-echo -e "  GKE Cluster  :  ${CLUSTER}  (${REGION})"
-echo -e "  Container    :  ${IMAGE}"
-echo -e "  RAG Corpus   :  ${RAG_CORPUS_ID}"
-echo -e "  GCS Bucket   :  gs://${GCS_BUCKET}"
-echo -e "  Agent Model  :  ${AGENT_MODEL}"
-echo -e "  Domain       :  ${DOMAIN}"
-echo -e "  Static IP    :  ${STATIC_IP_NAME}"
+echo -e "  Project ID     :  ${PROJECT_ID}"
+echo -e "  GKE Cluster    :  ${CLUSTER_NAME}  (${REGION})"
+echo -e "  Container      :  ${IMAGE}:latest"
+echo -e "  Domain         :  ${DOMAIN:-"(none — BACKEND_WS_URL must be set manually)"}"
+echo -e "  RAG Corpus     :  ${RAG_CORPUS_ID}"
+echo -e "  GCS Bucket     :  gs://${GCS_BUCKET}"
+echo -e "  Agent Model    :  ${AGENT_MODEL}"
 hr
 echo ""
 echo -en "  ${BOLD}Proceed with deployment? [Y/n]:${RESET} "
@@ -149,42 +125,6 @@ gcloud services enable \
   --project="$PROJECT_ID" --quiet
 info "APIs enabled"
 
-# ── GKE Cluster ─────────────────────────────────────────────────────────────────
-step "GKE Cluster: ${CLUSTER}"
-
-if gcloud container clusters describe "$CLUSTER" \
-    --region="$REGION" --project="$PROJECT_ID" \
-    --format="value(name)" &>/dev/null 2>&1; then
-
-  info "Cluster already exists"
-
-  # Ensure Workload Identity is enabled
-  _WI=$(gcloud container clusters describe "$CLUSTER" \
-    --region="$REGION" --project="$PROJECT_ID" \
-    --format="value(workloadIdentityConfig.workloadPool)" 2>/dev/null || true)
-
-  if [[ -z "${_WI:-}" ]]; then
-    warn "Workload Identity not enabled — enabling now (takes ~5 min)..."
-    gcloud container clusters update "$CLUSTER" \
-      --region="$REGION" --project="$PROJECT_ID" \
-      --workload-pool="${PROJECT_ID}.svc.id.goog" --quiet
-    info "Workload Identity enabled"
-  else
-    info "Workload Identity already enabled"
-  fi
-
-else
-  warn "Cluster not found — creating with Workload Identity (takes ~10 min)..."
-  gcloud container clusters create "$CLUSTER" \
-    --region="$REGION" \
-    --project="$PROJECT_ID" \
-    --num-nodes=1 \
-    --machine-type=e2-standard-4 \
-    --workload-pool="${PROJECT_ID}.svc.id.goog" \
-    --quiet
-  info "Cluster created: ${CLUSTER}"
-fi
-
 # ── GCP Service Account ────────────────────────────────────────────────────────
 step "GCP Service Account: ${GCP_SA_EMAIL}"
 
@@ -199,7 +139,7 @@ else
   info "Service account created"
 fi
 
-# ── IAM Role Bindings (--condition=None) ──────────────────────────────────────
+# ── IAM Role Bindings ─────────────────────────────────────────────────────────
 step "Granting IAM roles to backend SA (condition=None)"
 
 for ROLE in \
@@ -214,21 +154,8 @@ for ROLE in \
   info "Granted ${ROLE}"
 done
 
-# ── Workload Identity Binding (--condition=None) ───────────────────────────────
-step "Binding Workload Identity (condition=None)"
-
-_WI_MEMBER="serviceAccount:${PROJECT_ID}.svc.id.goog[${GKE_NAMESPACE}/${K8S_SA_NAME}]"
-
-gcloud iam service-accounts add-iam-policy-binding "$GCP_SA_EMAIL" \
-  --role="roles/iam.workloadIdentityUser" \
-  --member="$_WI_MEMBER" \
-  --condition=None \
-  --quiet
-
-info "Bound: ${_WI_MEMBER}"
-
-# ── Cloud Build SA Permissions (--condition=None) ─────────────────────────────
-step "Granting Cloud Build SA access to GKE + GCR"
+# ── Cloud Build SA Permissions ────────────────────────────────────────────────
+step "Granting Cloud Build SA access to GCR + GKE"
 
 _PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" \
   --format="value(projectNumber)")
@@ -236,7 +163,8 @@ _CB_SA="${_PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
 
 for ROLE in \
   "roles/container.developer" \
-  "roles/storage.admin"; do
+  "roles/storage.admin" \
+  "roles/iam.serviceAccountUser"; do
 
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${_CB_SA}" \
@@ -259,105 +187,159 @@ else
   info "Bucket created"
 fi
 
-# ── Global static IP ──────────────────────────────────────────────────────────
+# ── Reserve global static IP ───────────────────────────────────────────────────
 step "Global static IP: ${STATIC_IP_NAME}"
 
 if gcloud compute addresses describe "$STATIC_IP_NAME" \
     --global --project="$PROJECT_ID" &>/dev/null 2>&1; then
-  info "Static IP already exists"
+  info "Static IP already reserved"
 else
   gcloud compute addresses create "$STATIC_IP_NAME" \
-    --global --project="$PROJECT_ID"
+    --global \
+    --project="$PROJECT_ID"
   info "Static IP reserved"
 fi
 
 _STATIC_IP=$(gcloud compute addresses describe "$STATIC_IP_NAME" \
   --global --project="$PROJECT_ID" --format="value(address)")
-info "Static IP address: ${_STATIC_IP}"
+info "Static IP: ${_STATIC_IP}"
 
-# ── Update configuration files ─────────────────────────────────────────────────
-step "Updating configuration files"
+# ── GKE Autopilot cluster ─────────────────────────────────────────────────────
+step "GKE Autopilot cluster: ${CLUSTER_NAME}"
 
-# backend/config.py — update default values
-sed -i \
-  -e "s|os.getenv(\"PROJECT_ID\",[ ]*\"[^\"]*\")|os.getenv(\"PROJECT_ID\", \"${PROJECT_ID}\")|g" \
-  -e "s|os.getenv(\"LOCATION\",[ ]*\"[^\"]*\")|os.getenv(\"LOCATION\", \"${REGION}\")|g" \
-  -e "s|os.getenv(\"RAG_CORPUS_ID\",[ ]*\"[^\"]*\")|os.getenv(\"RAG_CORPUS_ID\", \"${RAG_CORPUS_ID}\")|g" \
-  -e "s|os.getenv(\"DEMO_AGENT_MODEL\",[ ]*\"[^\"]*\")|os.getenv(\"DEMO_AGENT_MODEL\", \"${AGENT_MODEL}\")|g" \
-  -e "s|os.getenv(\"GCS_RECORDINGS_BUCKET\",[ ]*\"[^\"]*\")|os.getenv(\"GCS_RECORDINGS_BUCKET\", \"${GCS_BUCKET}\")|g" \
-  backend/config.py
-info "backend/config.py"
+if gcloud container clusters describe "$CLUSTER_NAME" \
+    --region="$REGION" --project="$PROJECT_ID" &>/dev/null 2>&1; then
+  info "Cluster already exists"
+else
+  echo "  Creating GKE Autopilot cluster — this may take a few minutes..."
+  gcloud container clusters create-auto "$CLUSTER_NAME" \
+    --region="$REGION" \
+    --project="$PROJECT_ID" \
+    --quiet
+  info "Cluster created"
+fi
 
-# k8s/configmap.yaml — environment variables injected into GKE pods
-sed -i \
-  -e "s|PROJECT_ID: \"[^\"]*\"|PROJECT_ID: \"${PROJECT_ID}\"|g" \
-  -e "s|LOCATION: \"[^\"]*\"|LOCATION: \"${REGION}\"|g" \
-  -e "s|GOOGLE_CLOUD_PROJECT: \"[^\"]*\"|GOOGLE_CLOUD_PROJECT: \"${PROJECT_ID}\"|g" \
-  -e "s|GOOGLE_CLOUD_LOCATION: \"[^\"]*\"|GOOGLE_CLOUD_LOCATION: \"${REGION}\"|g" \
-  -e "s|RAG_CORPUS_ID: \"[^\"]*\"|RAG_CORPUS_ID: \"${RAG_CORPUS_ID}\"|g" \
-  -e "s|DEMO_AGENT_MODEL: \"[^\"]*\"|DEMO_AGENT_MODEL: \"${AGENT_MODEL}\"|g" \
-  -e "s|GCS_RECORDINGS_BUCKET: \"[^\"]*\"|GCS_RECORDINGS_BUCKET: \"${GCS_BUCKET}\"|g" \
-  k8s/configmap.yaml
-info "k8s/configmap.yaml"
+# ── Get cluster credentials ────────────────────────────────────────────────────
+step "Fetching cluster credentials"
+gcloud container clusters get-credentials "$CLUSTER_NAME" \
+  --region="$REGION" \
+  --project="$PROJECT_ID"
+info "kubectl context configured"
 
-# k8s/serviceaccount.yaml — Workload Identity annotation
-sed -i \
-  -e "s|iam.gke.io/gcp-service-account:.*|iam.gke.io/gcp-service-account: ${GCP_SA_EMAIL}|g" \
-  k8s/serviceaccount.yaml
-info "k8s/serviceaccount.yaml"
-
-# k8s/deployment.yaml — container image (also patched by cloudbuild step 3)
-sed -i \
-  -e "s|image: gcr.io/[^/]*/geminilive-glive:[^[:space:]]*|image: ${IMAGE}:latest|g" \
-  k8s/deployment.yaml
-info "k8s/deployment.yaml"
-
-# k8s/ingress.yaml — domain and static IP
-sed -i \
-  -e "s|REPLACE_WITH_DOMAIN|${DOMAIN}|g" \
-  -e "s|REPLACE_WITH_STATIC_IP_NAME|${STATIC_IP_NAME}|g" \
-  k8s/ingress.yaml
-info "k8s/ingress.yaml"
-
-# k8s/configmap.yaml — set BACKEND_WS_URL to the domain immediately
-sed -i \
-  -e "s|BACKEND_WS_URL: \"[^\"]*\"|BACKEND_WS_URL: \"wss://${DOMAIN}\"|g" \
-  k8s/configmap.yaml
-info "k8s/configmap.yaml (BACKEND_WS_URL)"
-
-# ── Fetch GKE credentials ──────────────────────────────────────────────────────
-step "Fetching GKE credentials for kubectl"
-gcloud container clusters get-credentials "$CLUSTER" \
-  --region="$REGION" --project="$PROJECT_ID" --quiet
-info "kubectl context updated"
-
-# ── Cloud Build — build image + deploy to GKE ─────────────────────────────────
-step "Submitting Cloud Build  (build → push → deploy)"
+# ── Build and push container image ────────────────────────────────────────────
+step "Building and pushing container image"
 echo ""
-echo -e "  ${YELLOW}This may take several minutes. Progress is shown below.${RESET}"
+echo -e "  ${YELLOW}Submitting Cloud Build — this may take several minutes.${RESET}"
 echo ""
 
 gcloud builds submit \
   --project="$PROJECT_ID" \
-  --config cloudbuild.yaml \
-  --substitutions "_GKE_CLUSTER=${CLUSTER},_GKE_REGION=${REGION}" \
-  .
+  --tag="${IMAGE}:latest" \
+  ./backend
 
-info "Cloud Build completed"
+info "Image pushed to ${IMAGE}:latest"
 
-# ── Final ConfigMap patch with domain ────────────────────────────────────────
-step "Patching ConfigMap with BACKEND_WS_URL"
+# ── Apply Kubernetes manifests ─────────────────────────────────────────────────
+step "Applying Kubernetes manifests"
+
+# 1. Namespace
+kubectl apply -f k8s/namespace.yaml
+info "Namespace applied"
+
+# 2. ServiceAccount (substitute project ID)
+sed "s|YOUR_PROJECT_ID|${PROJECT_ID}|g" k8s/serviceaccount.yaml | kubectl apply -f -
+info "ServiceAccount applied"
+
+# 3. ConfigMap (generate inline with actual values)
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gemini-live-config
+  namespace: gemini-live
+data:
+  PROJECT_ID: "${PROJECT_ID}"
+  LOCATION: "${REGION}"
+  GOOGLE_GENAI_USE_VERTEXAI: "TRUE"
+  GOOGLE_CLOUD_PROJECT: "${PROJECT_ID}"
+  GOOGLE_CLOUD_LOCATION: "${REGION}"
+  RAG_CORPUS_ID: "${RAG_CORPUS_ID}"
+  DEMO_AGENT_MODEL: "${AGENT_MODEL}"
+  GCS_RECORDINGS_BUCKET: "${GCS_BUCKET}"
+  PORT: "8080"
+  HOST: "0.0.0.0"
+  BACKEND_WS_URL: ""
+EOF
+info "ConfigMap applied"
+
+# 4. Deployment + HPA (substitute image registry project)
+sed "s|YOUR_PROJECT_ID|${PROJECT_ID}|g" k8s/deployment.yaml | kubectl apply -f -
+info "Deployment + HPA applied"
+
+# 5. Service + BackendConfig
+kubectl apply -f k8s/service.yaml
+info "Service + BackendConfig applied"
+
+# 6. Ingress (with ManagedCertificate + FrontendConfig)
+if [[ -n "${DOMAIN}" ]]; then
+  sed -e "s|REPLACE_WITH_DOMAIN|${DOMAIN}|g" \
+      -e "s|REPLACE_WITH_STATIC_IP_NAME|${STATIC_IP_NAME}|g" \
+      k8s/ingress.yaml | kubectl apply -f -
+  info "Ingress + ManagedCertificate applied"
+  warn "DNS: create an A record pointing ${DOMAIN} → ${_STATIC_IP}"
+  warn "TLS cert provisioning takes 15–60 min after DNS propagation."
+else
+  warn "No domain provided — skipping Ingress/TLS. You must set BACKEND_WS_URL manually."
+  warn "To add TLS later, re-run: ./deploy.sh and provide a domain."
+fi
+
+# ── Workload Identity binding ──────────────────────────────────────────────────
+step "Configuring Workload Identity"
+
+gcloud iam service-accounts add-iam-policy-binding "${GCP_SA_EMAIL}" \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="serviceAccount:${PROJECT_ID}.svc.id.goog[${KSA_NAMESPACE}/${KSA_NAME}]" \
+  --project="$PROJECT_ID" \
+  --quiet
+
+info "Workload Identity binding created"
+
+# Annotate the KSA so GKE knows which GSA it maps to
+kubectl annotate serviceaccount "${KSA_NAME}" \
+  --namespace="${KSA_NAMESPACE}" \
+  iam.gke.io/gcp-service-account="${GCP_SA_EMAIL}" \
+  --overwrite
+info "KSA annotation confirmed"
+
+# ── Wait for rollout ───────────────────────────────────────────────────────────
+step "Waiting for Deployment rollout"
+kubectl rollout status deployment/gemini-live-backend \
+  --namespace=gemini-live \
+  --timeout=300s
+info "Deployment is ready"
+
+# ── Set BACKEND_WS_URL ─────────────────────────────────────────────────────────
+step "Configuring BACKEND_WS_URL"
+
+if [[ -n "${DOMAIN}" ]]; then
+  _WS_URL="wss://${DOMAIN}"
+else
+  _WS_URL="wss://${_STATIC_IP}"
+fi
 
 kubectl patch configmap gemini-live-config \
-  -n "$GKE_NAMESPACE" \
-  --type merge \
-  -p "{\"data\":{\"BACKEND_WS_URL\":\"wss://${DOMAIN}\"}}"
+  --namespace=gemini-live \
+  --type=merge \
+  -p "{\"data\":{\"BACKEND_WS_URL\":\"${_WS_URL}\"}}"
 
-kubectl rollout restart deployment/gemini-live-backend -n "$GKE_NAMESPACE" --quiet
-kubectl rollout status  deployment/gemini-live-backend -n "$GKE_NAMESPACE" \
-  --timeout=120s
+kubectl rollout restart deployment/gemini-live-backend \
+  --namespace=gemini-live
 
-info "BACKEND_WS_URL = wss://${DOMAIN}"
+kubectl rollout status deployment/gemini-live-backend \
+  --namespace=gemini-live \
+  --timeout=300s
+
+info "BACKEND_WS_URL = ${_WS_URL}"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
@@ -365,16 +347,28 @@ hr
 echo -e "  ${GREEN}${BOLD}Deployment complete!${RESET}"
 hr
 echo ""
-echo -e "  Static IP     :  ${BOLD}${_STATIC_IP}${RESET}"
-echo -e "  Domain        :  ${BOLD}${DOMAIN}${RESET}"
-echo -e "  Health check  :  ${BOLD}https://${DOMAIN}/health${RESET}"
-echo -e "  Exotel webhook:  ${BOLD}https://${DOMAIN}/exotel/webhook${RESET}"
-echo -e "  WebSocket URL :  ${BOLD}wss://${DOMAIN}/exotel/stream${RESET}"
+echo -e "  GKE Cluster    :  ${BOLD}${CLUSTER_NAME}${RESET} (${REGION})"
+echo -e "  Static IP      :  ${BOLD}${_STATIC_IP}${RESET}"
+if [[ -n "${DOMAIN}" ]]; then
+  echo -e "  Domain         :  ${BOLD}${DOMAIN}${RESET}"
+  echo -e "  Backend URL    :  ${BOLD}${_WS_URL}${RESET}"
+fi
 echo ""
-echo -e "  ${YELLOW}⚠  DNS setup required (if not done already):${RESET}"
-echo -e "     Create an A record:  ${BOLD}${DOMAIN}  →  ${_STATIC_IP}${RESET}"
+echo -e "  ${YELLOW}⚠  Configure Exotel:${RESET}"
+if [[ -n "${DOMAIN}" ]]; then
+  echo -e "     Webhook URL  : ${BOLD}https://${DOMAIN}/exotel/webhook${RESET}"
+  echo -e "     WebSocket URL: ${BOLD}${_WS_URL}/exotel/stream${RESET}"
+else
+  echo -e "     Once your domain is configured, re-run ./deploy.sh to set BACKEND_WS_URL."
+fi
 echo ""
-echo -e "  ${YELLOW}⚠  TLS certificate status:${RESET}"
-echo -e "     kubectl describe managedcertificate gemini-live-cert -n ${GKE_NAMESPACE}"
-echo -e "     Certificate provisioning takes 15–60 min after DNS propagates."
+echo -e "  ${YELLOW}⚠  Re-deploy after code changes:${RESET}"
+echo -e "     gcloud builds submit \\"
+echo -e "       --config cloudbuild.yaml \\"
+echo -e "       --substitutions \"_CLUSTER_NAME=${CLUSTER_NAME},_REGION=${REGION}\" \\"
+echo -e "       ."
+echo ""
+echo -e "  ${YELLOW}⚠  Check pod status:${RESET}"
+echo -e "     kubectl get pods -n gemini-live"
+echo -e "     kubectl logs -f -n gemini-live deploy/gemini-live-backend"
 echo ""

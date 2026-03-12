@@ -1,13 +1,20 @@
 # Service for the Gemini Live backend.
 #
 # type: NodePort — traffic arrives via the GKE HTTP(S) Ingress (ingress.yaml),
-# which terminates TLS and forwards to this service over HTTP.
+# which terminates TLS and forwards to this Service over HTTP.
+#
+# sessionAffinity: ClientIP — Gemini Live API Best Practice (go/gemini-live-bible §4.2.1):
+#   WebSocket sessions are stateful; the active connection to the Gemini Live
+#   API and per-call audio state live in a single pod. ClientIP affinity pins
+#   all requests from the same caller to the same pod, preventing state loss
+#   if load is rebalanced mid-call.
 #
 # Annotations:
-#   backend-config  — tells the HTTP(S) LB to use the 3600 s timeout defined in
-#                     BackendConfig (effective because this service is Ingress-backed).
-#   neg             — enables container-native load balancing; the LB routes
-#                     directly to pod IPs instead of going through kube-proxy.
+#   backend-config  — references BackendConfig below, which sets the
+#                     3600 s backend timeout required for long voice calls
+#                     (standard GCP HTTPS LB default is 30 s).
+#   neg             — enables container-native load balancing so the LB
+#                     routes directly to pod IPs, bypassing kube-proxy.
 apiVersion: v1
 kind: Service
 metadata:
@@ -27,11 +34,18 @@ spec:
       port: 80
       targetPort: 8080
       protocol: TCP
+  # Pin requests from the same caller IP to the same pod for the duration of
+  # a call. Critical for WebSocket connection stability (Gemini Live Bible).
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      # 3600 s matches the maximum supported call duration.
+      timeoutSeconds: 3600
 
 ---
-# BackendConfig — sets the HTTP timeout to 3600 s so long calls are not
-# dropped by the GCP load balancer. Effective when referenced by an
-# Ingress-backed Service (which this service now is).
+# BackendConfig — sets the HTTP backend timeout to 3600 s so that long
+# voice calls are not terminated by the GCP load balancer's default 30 s
+# idle timeout. Also configures connection draining for graceful shutdowns.
 apiVersion: cloud.google.com/v1
 kind: BackendConfig
 metadata:

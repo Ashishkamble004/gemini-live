@@ -1,19 +1,20 @@
-# GKE HTTP(S) Ingress with Google-managed TLS certificate
+# GKE HTTPS Ingress with Google-managed TLS certificate.
 #
-# Prerequisites (handled automatically by deploy.sh):
+# Prerequisites (handled by deploy.sh):
 #   1. A global static IP is reserved:
 #        gcloud compute addresses create gemini-live-ip --global
-#   2. Your domain's A record points to that IP.
-#   3. deploy.sh fills in REPLACE_WITH_DOMAIN and REPLACE_WITH_STATIC_IP_NAME.
+#   2. Your domain's A record points to that static IP.
+#   3. deploy.sh substitutes REPLACE_WITH_DOMAIN and REPLACE_WITH_STATIC_IP_NAME.
 #
-# After applying, certificate provisioning takes 15–60 min once DNS propagates.
+# After deployment, Google-managed certificate provisioning takes 15–60 min
+# once the DNS A record has propagated.
 # Monitor: kubectl describe managedcertificate gemini-live-cert -n gemini-live
 #
-# BackendConfig (defined in service.yaml) sets the 3600 s backend timeout,
-# which is required for long-running calls.
+# BackendConfig (in service.yaml) sets the 3600 s backend timeout, which is
+# required for long-running voice calls.
 
 ---
-# Google-managed TLS certificate — auto-renewed, zero maintenance.
+# Google-managed TLS certificate — auto-provisioned and auto-renewed.
 apiVersion: networking.gke.io/v1
 kind: ManagedCertificate
 metadata:
@@ -24,7 +25,7 @@ spec:
     - REPLACE_WITH_DOMAIN
 
 ---
-# FrontendConfig: redirect plain HTTP (port 80) to HTTPS.
+# FrontendConfig: redirect plain HTTP (port 80) → HTTPS.
 apiVersion: networking.gke.io/v1beta1
 kind: FrontendConfig
 metadata:
@@ -37,7 +38,7 @@ spec:
 
 ---
 # Ingress — creates a GCP HTTP(S) Global Load Balancer.
-# All traffic (including WebSocket upgrades) is routed to gemini-live-backend.
+# All traffic (including WebSocket upgrades) routes to gemini-live-backend.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

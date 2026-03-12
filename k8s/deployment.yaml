@@ -16,12 +16,13 @@ spec:
     spec:
       serviceAccountName: gemini-live-sa
 
-      # Graceful shutdown: allow in-flight calls to finish (max 10 min)
+      # Graceful shutdown: allow in-flight calls to finish (up to 10 min).
+      # Active WebSocket sessions receive a SIGTERM; uvicorn lets them drain.
       terminationGracePeriodSeconds: 600
 
       containers:
         - name: backend
-          # Image is updated by cloudbuild.yaml on every push.
+          # Image is substituted by deploy.sh / updated by cloudbuild.yaml.
           # Replace YOUR_PROJECT_ID with your actual GCP project ID.
           image: gcr.io/YOUR_PROJECT_ID/geminilive-glive:latest
           imagePullPolicy: Always
@@ -29,6 +30,7 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
+            # UID 1001 matches the appuser created in the Dockerfile.
             runAsUser: 1001
             capabilities:
               drop: ["ALL"]
@@ -38,7 +40,7 @@ spec:
               containerPort: 8080
               protocol: TCP
 
-          # Load non-secret config from ConfigMap
+          # All non-secret config is loaded from the ConfigMap.
           envFrom:
             - configMapRef:
                 name: gemini-live-config
@@ -68,7 +70,7 @@ spec:
             failureThreshold: 3
 
 ---
-# Optional: auto-scale based on CPU usage
+# Horizontal Pod Autoscaler — scale on CPU
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

@@ -17,7 +17,16 @@ Call flow:
   7. Conversation transcript is saved to GCS.
 
 Authentication:
-  Uses Vertex AI with Workload Identity — no API key required.
+  Uses Vertex AI with Workload Identity (GKE) or Service Account (Cloud Run).
+
+Gemini Live Bible best practices applied:
+  - VAD: END_SENSITIVITY_LOW + 800ms silence for natural Hindi/Hinglish pauses.
+  - TurnCoverage: TURN_INCLUDES_ALL_INPUT ensures barge-in audio reaches model.
+  - Interruption handling: on event.interrupted, reset audio state + send
+    "clear" to Exotel to immediately stop playing stale audio.
+  - Intro restart: if the caller interrupts before Arjun finishes the greeting,
+    inject a hidden [System: ...] message so the agent restarts cleanly.
+  - UNMISTAKABLY keyword in system instruction improves tool-call adherence.
 """
 
 import asyncio
@@ -108,7 +117,20 @@ runner = Runner(app_name=APP_NAME, agent=agent, session_service=session_service)
 # ---------------------------------------------------------------------------
 
 def _build_run_config() -> RunConfig:
-    """Build a RunConfig for native-audio models (telephony use-case)."""
+    """Build a RunConfig for native-audio models (telephony use-case).
+
+    VAD tuning (Gemini Live Bible recommendations):
+      - START_SENSITIVITY_LOW  : robust against background noise / hold music on
+                                 phone lines; less prone to false starts.
+      - END_SENSITIVITY_LOW    : lets callers finish their thought naturally.
+                                 Hindi/Hinglish speakers pause between clauses —
+                                 HIGH would cut them off mid-sentence.
+      - silence_duration_ms=800: balances 500ms (too aggressive) with 1200ms
+                                 (adds too much latency). 800ms is comfortable.
+      - TURN_INCLUDES_ALL_INPUT: full audio stream, including the caller's barge-in
+                                 speech, is passed to the model so it understands
+                                 what the user said during interruption.
+    """
     return RunConfig(
         streaming_mode=StreamingMode.BIDI,
         response_modalities=["AUDIO"],
@@ -122,11 +144,17 @@ def _build_run_config() -> RunConfig:
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
                 disabled=False,
+                # LOW: robust against phone-line noise / false starts
                 start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
-                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                # LOW: allows natural mid-sentence pauses (Hindi/Hinglish speakers)
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
                 prefix_padding_ms=100,
-                silence_duration_ms=500,
-            )
+                # 800ms: comfortable pause before end-of-turn (was 500ms, too aggressive)
+                silence_duration_ms=800,
+            ),
+            # All caller audio — including barge-in audio — goes to the model
+            # Required for proper interruption handling (Gemini Live Bible)
+            turn_coverage=types.TurnCoverage.TURN_INCLUDES_ALL_INPUT,
         ),
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
@@ -207,7 +235,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
     Outbound messages to Exotel:
       {"event": "media", "streamSid": "...", "media": {"payload": "<b64 pcm16k>"}}
       {"event": "mark",  "streamSid": "...", "mark":  {"name": "<label>"}}
-      {"event": "clear", "streamSid": "..."}
+      {"event": "clear", "streamSid": "..."}   ← sent on model interruption
     """
     await websocket.accept()
 
@@ -225,6 +253,14 @@ async def exotel_stream(websocket: WebSocket) -> None:
     downsample_state: Any = None
 
     call_stop_event = asyncio.Event()
+
+    # --- Intro restart state (Gemini Live Bible workaround) ---------------
+    # If the caller interrupts Arjun before the greeting is complete, inject
+    # a hidden [System: ...] message so Arjun restarts cleanly.
+    # "intro complete" = Arjun has asked for the caller's name (contains "नाम").
+    intro_complete: bool = False
+    intro_restart_injected: bool = False
+    cumulative_output_text: str = ""
 
     logger.info(f"Exotel WebSocket connected — user_id={user_id}, session_id={session_id}")
 
@@ -248,7 +284,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     websocket.receive(), timeout=30.0
                 )
             except asyncio.TimeoutError:
-                # Send a keepalive / heartbeat — do nothing, just loop
+                # keepalive — no action needed
                 continue
 
             if "text" not in message:
@@ -285,7 +321,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 if not payload_b64:
                     continue
                 try:
-                    # Exotel sends PCM 16kHz — pass directly to Gemini
+                    # Exotel sends PCM 16kHz — pass directly to Gemini (no conversion)
                     pcm_16k = base64.b64decode(payload_b64)
                     if pcm_16k:
                         blob = types.Blob(
@@ -306,6 +342,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
 
     async def downstream_task() -> None:
         nonlocal conversation_messages, downsample_state
+        nonlocal intro_complete, intro_restart_injected, cumulative_output_text
 
         async for event in runner.run_live(
             user_id=user_id,
@@ -317,7 +354,58 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 break
 
             try:
-                # ---- collect transcriptions -----------------------------
+                # ---- handle model interruption (Gemini Live Bible) ----------
+                # When event.interrupted is True, the user spoke while Arjun was
+                # talking. We must:
+                #   1. Reset the resampler so stale audio state doesn't bleed through.
+                #   2. Send "clear" to Exotel so it immediately stops playing the
+                #      queued audio chunks — critical for natural barge-in.
+                #   3. Optionally restart the intro if it wasn't complete yet.
+                if getattr(event, "interrupted", False):
+                    downsample_state = None  # discard stale resampler state
+                    if stream_sid:
+                        await websocket.send_json(
+                            {"event": "clear", "streamSid": stream_sid}
+                        )
+                        logger.debug(
+                            "Model interrupted by caller — cleared Exotel audio buffer"
+                        )
+
+                    # Intro restart workaround (Gemini Live Bible):
+                    # If Arjun hasn't finished greeting and hasn't already been
+                    # restarted, inject a hidden system message.
+                    if not intro_complete and not intro_restart_injected:
+                        # Double-check: maybe the transcription arrived late
+                        if any(
+                            kw in cumulative_output_text.lower()
+                            for kw in ("नाम", "naam", "name", "client code")
+                        ):
+                            intro_complete = True
+                        else:
+                            logger.info(
+                                "Intro interrupted before completion — injecting restart"
+                            )
+                            live_request_queue.send_content(
+                                types.Content(
+                                    role="user",
+                                    parts=[
+                                        types.Part(
+                                            text=(
+                                                "[System: The customer did not hear your "
+                                                "introduction due to audio interruption. "
+                                                "Please restart your complete greeting from "
+                                                "the beginning: introduce yourself as Arjun "
+                                                "from Motilal Oswal and ask for the customer's "
+                                                "full name.]"
+                                            )
+                                        )
+                                    ],
+                                )
+                            )
+                            intro_restart_injected = True
+                    continue  # skip audio/turn processing for interrupted events
+
+                # ---- collect transcriptions ---------------------------------
                 if event.input_transcription:
                     if (
                         event.input_transcription.finished
@@ -332,6 +420,19 @@ async def exotel_stream(websocket: WebSocket) -> None:
                         )
 
                 if event.output_transcription:
+                    # Accumulate ALL output chunks (finished or not) for intro detection
+                    chunk_text = event.output_transcription.text or ""
+                    if chunk_text:
+                        cumulative_output_text += " " + chunk_text
+
+                    # Mark intro complete once Arjun has asked for name or client code
+                    if not intro_complete and any(
+                        kw in cumulative_output_text.lower()
+                        for kw in ("नाम", "naam", "name", "client code")
+                    ):
+                        intro_complete = True
+                        logger.debug("Arjun intro complete — barge-in restart disabled")
+
                     if (
                         event.output_transcription.finished
                         and event.output_transcription.text
@@ -344,7 +445,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                             }
                         )
 
-                # ---- stream audio back to Exotel -------------------------
+                # ---- stream audio back to Exotel ----------------------------
                 if event.content and event.content.parts:
                     for part in event.content.parts:
                         if (
@@ -372,7 +473,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                                     }
                                 )
 
-                # ---- send mark when model finishes a turn ----------------
+                # ---- send mark when model finishes a turn -------------------
                 if event.turn_complete and stream_sid:
                     await websocket.send_json(
                         {
@@ -416,8 +517,6 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     logger.info(f"Transcript saved: {uri}")
             except Exception as exc:
                 logger.error(f"Failed to save transcript: {exc}", exc_info=True)
-
-
 
 
 # ---------------------------------------------------------------------------
