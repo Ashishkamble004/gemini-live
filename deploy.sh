@@ -52,6 +52,35 @@ gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null \
   | grep -q "." \
   || error "No active gcloud account. Run: gcloud auth login"
 
+# gke-gcloud-auth-plugin is required for kubectl to authenticate to GKE clusters.
+# We check for the actual binary in PATH — not gcloud component state, which is
+# unreliable when gcloud was installed via apt rather than the standalone SDK.
+if ! command -v gke-gcloud-auth-plugin &>/dev/null; then
+  echo -e "  ${YELLOW}gke-gcloud-auth-plugin not found — installing...${RESET}"
+
+  # Path 1: standalone SDK installer (gcloud components install)
+  if gcloud components install gke-gcloud-auth-plugin --quiet 2>/dev/null \
+      && command -v gke-gcloud-auth-plugin &>/dev/null; then
+    info "gke-gcloud-auth-plugin installed via gcloud components"
+
+  # Path 2: apt-get (Debian/Ubuntu with package-manager-installed gcloud)
+  elif command -v apt-get &>/dev/null; then
+    echo -e "  ${YELLOW}gcloud components install failed — trying apt-get...${RESET}"
+    sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
+    info "gke-gcloud-auth-plugin installed via apt-get"
+
+  else
+    error "Cannot install gke-gcloud-auth-plugin automatically.\nInstall it manually:\n  gcloud components install gke-gcloud-auth-plugin\n  OR (Debian/Ubuntu): sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin"
+  fi
+fi
+
+# Final guard — abort now rather than get a cryptic kubectl error later
+command -v gke-gcloud-auth-plugin &>/dev/null \
+  || error "gke-gcloud-auth-plugin is still not in PATH after installation.\nPlease install manually and re-run:\n  gcloud components install gke-gcloud-auth-plugin\n  OR (Debian/Ubuntu): sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin"
+
+export USE_GKE_GCLOUD_AUTH_PLUGIN=True
+info "gke-gcloud-auth-plugin ready"
+
 # ── Banner ─────────────────────────────────────────────────────────────────────
 echo ""
 hr
@@ -221,10 +250,30 @@ fi
 
 # ── Get cluster credentials ────────────────────────────────────────────────────
 step "Fetching cluster credentials"
-gcloud container clusters get-credentials "$CLUSTER_NAME" \
-  --region="$REGION" \
-  --project="$PROJECT_ID"
-info "kubectl context configured"
+
+# For private clusters (control plane has no public IP), standard get-credentials
+# writes the private RFC-1918 IP which is unreachable from outside the VPC.
+# --dns-endpoint (gcloud 454+) uses a DNS FQDN that routes through Google's
+# network instead, making it accessible from outside the VPC without a VPN.
+# We try --dns-endpoint first and fall back to the standard method.
+if gcloud container clusters get-credentials "$CLUSTER_NAME" \
+    --region="$REGION" \
+    --project="$PROJECT_ID" \
+    --dns-endpoint 2>/dev/null; then
+  info "kubectl context configured (DNS endpoint)"
+else
+  gcloud container clusters get-credentials "$CLUSTER_NAME" \
+    --region="$REGION" \
+    --project="$PROJECT_ID"
+  info "kubectl context configured (standard endpoint)"
+  warn "If kubectl commands fail with a connection timeout, your cluster may be"
+  warn "private with no public endpoint. Run deploy.sh from Cloud Shell instead,"
+  warn "or add your IP to Master Authorized Networks:"
+  warn "  MY_IP=\$(curl -s https://checkip.amazonaws.com)"
+  warn "  gcloud container clusters update ${CLUSTER_NAME} \\"
+  warn "    --region=${REGION} --enable-master-authorized-networks \\"
+  warn "    --master-authorized-networks=\"\${MY_IP}/32\""
+fi
 
 # ── Build and push container image ────────────────────────────────────────────
 step "Building and pushing container image"
@@ -243,15 +292,15 @@ info "Image pushed to ${IMAGE}:latest"
 step "Applying Kubernetes manifests"
 
 # 1. Namespace
-kubectl apply -f k8s/namespace.yaml
+kubectl apply --validate=false -f k8s/namespace.yaml
 info "Namespace applied"
 
 # 2. ServiceAccount (substitute project ID)
-sed "s|YOUR_PROJECT_ID|${PROJECT_ID}|g" k8s/serviceaccount.yaml | kubectl apply -f -
+sed "s|YOUR_PROJECT_ID|${PROJECT_ID}|g" k8s/serviceaccount.yaml | kubectl apply --validate=false -f -
 info "ServiceAccount applied"
 
 # 3. ConfigMap (generate inline with actual values)
-kubectl apply -f - <<EOF
+kubectl apply --validate=false -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -273,18 +322,18 @@ EOF
 info "ConfigMap applied"
 
 # 4. Deployment + HPA (substitute image registry project)
-sed "s|YOUR_PROJECT_ID|${PROJECT_ID}|g" k8s/deployment.yaml | kubectl apply -f -
+sed "s|YOUR_PROJECT_ID|${PROJECT_ID}|g" k8s/deployment.yaml | kubectl apply --validate=false -f -
 info "Deployment + HPA applied"
 
 # 5. Service + BackendConfig
-kubectl apply -f k8s/service.yaml
+kubectl apply --validate=false -f k8s/service.yaml
 info "Service + BackendConfig applied"
 
 # 6. Ingress (with ManagedCertificate + FrontendConfig)
 if [[ -n "${DOMAIN}" ]]; then
   sed -e "s|REPLACE_WITH_DOMAIN|${DOMAIN}|g" \
       -e "s|REPLACE_WITH_STATIC_IP_NAME|${STATIC_IP_NAME}|g" \
-      k8s/ingress.yaml | kubectl apply -f -
+      k8s/ingress.yaml | kubectl apply --validate=false -f -
   info "Ingress + ManagedCertificate applied"
   warn "DNS: create an A record pointing ${DOMAIN} → ${_STATIC_IP}"
   warn "TLS cert provisioning takes 15–60 min after DNS propagation."

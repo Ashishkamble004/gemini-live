@@ -52,8 +52,11 @@ steps:
     args:
       - '-c'
       - |
-        # Install kubectl if not present (cloud-sdk image may need it)
-        gcloud components install kubectl --quiet 2>/dev/null || true
+        # Install kubectl and gke-gcloud-auth-plugin if not present.
+        # gke-gcloud-auth-plugin is required for kubectl to authenticate to GKE
+        # clusters (mandatory since kubectl 1.26 / gcloud 408.0.0).
+        gcloud components install kubectl gke-gcloud-auth-plugin --quiet 2>/dev/null || true
+        export USE_GKE_GCLOUD_AUTH_PLUGIN=True
 
         # Authenticate to the cluster
         gcloud container clusters get-credentials "$_CLUSTER_NAME" \

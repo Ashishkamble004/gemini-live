@@ -141,13 +141,70 @@ In GKE, all values are set in `k8s/configmap.yaml` and override the code default
 
 ---
 
+## Prerequisites
+
+Everything in this list must be in place before running `./deploy.sh`.
+
+### Local tools
+
+| Tool | Install / Verify |
+|---|---|
+| `gcloud` CLI | [Install guide](https://cloud.google.com/sdk/docs/install) · verify: `gcloud version` |
+| `kubectl` | `gcloud components install kubectl` · verify: `kubectl version --client` |
+| `gke-gcloud-auth-plugin` | Required for kubectl to authenticate to GKE (mandatory since kubectl 1.26). **deploy.sh installs this automatically.** Manual install: `gcloud components install gke-gcloud-auth-plugin` (standalone SDK) or `sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin` (apt/Debian/Ubuntu) |
+| `git` | Pre-installed on most systems · verify: `git --version` |
+| `bash` 4+ | macOS ships bash 3 — upgrade: `brew install bash`. Linux is fine. |
+
+### GCP account
+
+| Requirement | Notes |
+|---|---|
+| Active GCP account | `gcloud auth login` |
+| Application Default Credentials | `gcloud auth application-default login` |
+| Billing enabled on the project | Required for GKE, Cloud Build, Vertex AI, and GCS |
+| `Owner` or the following roles on the project | `roles/container.admin`, `roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin`, `roles/cloudbuild.builds.editor`, `roles/storage.admin` |
+
+### GCP resources (created by deploy.sh — listed for awareness)
+
+- GKE Autopilot cluster
+- GCP Service Account (`gemini-live-backend@PROJECT.iam.gserviceaccount.com`)
+- GCS bucket for transcripts
+- Global static IP (`gemini-live-ip`)
+- Container image in Google Container Registry (`gcr.io/PROJECT/geminilive-glive`)
+
+### Vertex AI RAG Corpus
+
+The customer verification sub-agent queries a Vertex AI RAG corpus containing MOFSL
+account records. This corpus must already exist before deploying. You need its numeric
+ID (e.g. `6917529027641081856`) to provide at the prompt.
+
+To find it:
+```bash
+gcloud ai rag corpora list --region=us-central1 --project=YOUR_PROJECT_ID
+```
+
+### Domain name (for TLS)
+
+A domain or subdomain that you control and can add DNS records to. Example:
+`mofsl.ak-demos.com`. See the [DNS Configuration](#dns-configuration) section below
+for setup instructions per provider.
+
+This is optional — leave blank at the prompt to skip TLS. In that case
+`BACKEND_WS_URL` must be set manually after the Ingress IP is assigned, and Exotel
+must support plain `ws://`.
+
+### Exotel account
+
+- An Exotel account with Media Streaming enabled (available on select plans)
+- A virtual number configured with an ExoML app
+- The ability to set a Webhook URL on the ExoML app
+
+---
+
 ## Automated Deployment (Recommended)
 
-**Prerequisites**:
-- `gcloud` CLI installed and authenticated (`gcloud auth login`)
-- `kubectl` installed (`gcloud components install kubectl`)
-- A GCP project with billing enabled
-- A domain name with DNS access (for TLS; optional but recommended for production)
+**Prerequisites**: all items in the [Prerequisites](#prerequisites) section above.
+
 
 ```bash
 ./deploy.sh
@@ -198,6 +255,110 @@ Cloud Build will:
 4. Wait for the rollout to complete (fails the build if pods do not become ready)
 
 Or set up a **Cloud Build trigger** in the Console to run this automatically on every push to `main`.
+
+---
+
+## DNS Configuration
+
+`deploy.sh` reserves a global static IP and prints it at the end of the run.
+You must create an **A record** pointing your chosen subdomain to that IP so that:
+
+1. Exotel can reach the HTTPS/WSS endpoint.
+2. Google's certificate manager can validate domain ownership and provision the
+   managed TLS certificate.
+
+The process is the same regardless of DNS provider — only the UI differs.
+
+> **Note:** Google-managed TLS certificates work with **any** DNS provider. Your
+> domain does not need to be registered with or transferred to Google.
+
+---
+
+### Cloudflare
+
+1. **Dashboard → ak-demos.com → DNS → Records → Add record**
+
+   | Field | Value |
+   |---|---|
+   | Type | `A` |
+   | Name | `mofsl` *(or your chosen subdomain)* |
+   | IPv4 address | `34.120.x.x` *(static IP from deploy.sh)* |
+   | TTL | `Auto` |
+   | Proxy status | **DNS only (grey cloud)** ← critical |
+
+2. Click **Save**.
+
+**Why "DNS only" (grey cloud)?**
+
+Cloudflare's orange-cloud proxy intercepts all traffic through Cloudflare's edge.
+This causes two problems for this deployment:
+
+- **Certificate provisioning fails** — Google validates the managed cert by sending
+  HTTP challenge requests to your domain. Cloudflare proxying intercepts them,
+  causing provisioning to hang or fail indefinitely.
+- **WebSocket timeout** — Cloudflare's free and pro plans impose a 100-second
+  WebSocket idle timeout. Voice calls longer than ~1.5 min will be dropped
+  mid-conversation. (Enterprise lifts this, but adds unnecessary complexity.)
+
+With DNS only, traffic goes directly to the GCP load balancer, TLS is terminated
+there by the Google-managed cert, and there is no timeout constraint.
+
+---
+
+### AWS Route 53
+
+1. **Route 53 → Hosted zones → ak-demos.com → Create record**
+
+   | Field | Value |
+   |---|---|
+   | Record name | `mofsl` *(or your chosen subdomain)* |
+   | Record type | `A` |
+   | Value | `34.120.x.x` *(static IP from deploy.sh)* |
+   | TTL | `300` |
+   | Routing policy | `Simple routing` |
+
+2. Click **Create records**.
+
+Route 53 is a pure DNS service — no proxy layer — so there are no additional
+gotchas.
+
+---
+
+### Akamai Edge DNS
+
+1. **Akamai Control Center → Edge DNS → ak-demos.com → Records → Add**
+
+   | Field | Value |
+   |---|---|
+   | Name | `mofsl.ak-demos.com` |
+   | Type | `A` |
+   | TTL | `300` |
+   | Target | `34.120.x.x` *(static IP from deploy.sh)* |
+
+2. **Save** and then **Activate** the zone version.
+
+Akamai Edge DNS is a pure authoritative DNS service — no traffic proxying — so
+certificate provisioning and WebSocket connections work without any extra steps.
+
+---
+
+### After creating the DNS record
+
+Check propagation (usually a few minutes with TTL 300):
+```bash
+dig mofsl.ak-demos.com +short
+# Should return your static IP
+```
+
+Monitor TLS certificate provisioning (takes 15–60 min after DNS propagates):
+```bash
+kubectl describe managedcertificate gemini-live-cert -n gemini-live
+# Status.CertificateStatus should move to: Active
+```
+
+Once the cert is `Active`:
+- Webhook URL for Exotel: `https://mofsl.ak-demos.com/exotel/webhook`
+- `BACKEND_WS_URL` (already set by deploy.sh): `wss://mofsl.ak-demos.com`
 
 ---
 
@@ -288,3 +449,4 @@ kubectl rollout status deployment/gemini-live-backend -n gemini-live
 | Call drops mid-conversation | Check `sessionAffinity: ClientIP` is set; check BackendConfig `timeoutSec: 3600` |
 | TLS cert not provisioning | DNS A record may not have propagated; can take up to 60 min |
 | Cold start on first call | Ensure HPA `minReplicas: 1`; pod should always be running |
+| `gke-gcloud-auth-plugin` not found / not executable | Standalone SDK: `gcloud components install gke-gcloud-auth-plugin`. Apt/Debian/Ubuntu: `sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin`. Then re-run deploy.sh |
