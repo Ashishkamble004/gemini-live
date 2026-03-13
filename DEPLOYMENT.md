@@ -51,7 +51,7 @@ GKE HTTP(S) Global Load Balancer
     │  TLS termination (Google-managed cert)
     │  Static global IP
     ▼
-GKE Ingress  →  Service (sessionAffinity: ClientIP)  →  Pod(s)
+GKE Gateway  →  Service (sessionAffinity: ClientIP)  →  Pod(s)
 ```
 
 **Authentication**: Workload Identity — pods authenticate to GCP APIs as the
@@ -89,8 +89,8 @@ GKE Ingress  →  Service (sessionAffinity: ClientIP)  →  Pod(s)
 │   ├── serviceaccount.yaml          # KSA with Workload Identity annotation
 │   ├── configmap.yaml               # Non-secret config (env vars)
 │   ├── deployment.yaml              # Deployment + HorizontalPodAutoscaler
-│   ├── service.yaml                 # NodePort Service + BackendConfig (3600s timeout)
-│   └── ingress.yaml                 # HTTPS Ingress + ManagedCertificate + FrontendConfig
+│   ├── service.yaml                 # NodePort Service
+│   └── gateway.yaml                 # Gateway + HTTPRoutes + GCPBackendPolicy
 │
 └── backend/
     ├── config.py                    # ← Edit defaults here (or use env vars / configmap)
@@ -134,10 +134,10 @@ In GKE, all values are set in `k8s/configmap.yaml` and override the code default
 |---|---|---|
 | `service.yaml` | `sessionAffinity: ClientIP` | Pins each caller to the same pod. Required for stateful WebSocket connections (Gemini Live Bible §4.2.1). |
 | `service.yaml` | `sessionAffinityConfig.timeoutSeconds: 3600` | Session affinity persists for the full max call duration. |
-| `service.yaml` (BackendConfig) | `timeoutSec: 3600` | Prevents GCP LB from dropping long calls (default 30 s). |
+| `gateway.yaml` (GCPBackendPolicy) | `timeoutSec: 3600` | Prevents GCP LB from dropping long calls (default 30 s). |
 | `deployment.yaml` | `terminationGracePeriodSeconds: 600` | Active calls drain gracefully on rolling updates. |
 | `deployment.yaml` (HPA) | `minReplicas: 1, maxReplicas: 5` | Always-warm pod avoids cold-start latency; scales under load. |
-| `ingress.yaml` | Google-managed cert | Automatic TLS — zero maintenance. |
+| `gateway.yaml` | Certificate Manager cert map | Automatic TLS via Certificate Manager — zero maintenance. |
 
 ---
 
@@ -190,7 +190,7 @@ A domain or subdomain that you control and can add DNS records to. Example:
 for setup instructions per provider.
 
 This is optional — leave blank at the prompt to skip TLS. In that case
-`BACKEND_WS_URL` must be set manually after the Ingress IP is assigned, and Exotel
+`BACKEND_WS_URL` must be set manually after the Gateway IP is assigned, and Exotel
 must support plain `ws://`.
 
 ### Exotel account
@@ -352,8 +352,9 @@ dig mofsl.ak-demos.com +short
 
 Monitor TLS certificate provisioning (takes 15–60 min after DNS propagates):
 ```bash
-kubectl describe managedcertificate gemini-live-cert -n gemini-live
-# Status.CertificateStatus should move to: Active
+gcloud certificate-manager certificates describe gemini-live-cert \
+  --project=YOUR_PROJECT_ID
+# State should move to: ACTIVE
 ```
 
 Once the cert is `Active`:
@@ -406,8 +407,8 @@ curl http://localhost:8080/exotel/webhook
 | Deployment | `terminationGracePeriodSeconds` | 600 s | Graceful drain of in-flight calls |
 | Service | `sessionAffinity` | `ClientIP` | WebSocket state pinned to one pod |
 | Service | `sessionAffinityConfig.timeoutSeconds` | 3600 s | Persists for full call duration |
-| BackendConfig | `timeoutSec` | 3600 s | LB does not drop long calls |
-| BackendConfig | `drainingTimeoutSec` | 600 s | Matches pod termination grace period |
+| GCPBackendPolicy | `timeoutSec` | 3600 s | LB does not drop long calls |
+| GCPBackendPolicy | `drainingTimeoutSec` | 600 s | Matches pod termination grace period |
 
 ---
 
@@ -426,9 +427,9 @@ kubectl describe pod -n gemini-live <pod-name>
 # View ConfigMap (check env vars)
 kubectl describe configmap gemini-live-config -n gemini-live
 
-# Check Ingress IP and TLS status
-kubectl describe ingress gemini-live-ingress -n gemini-live
-kubectl describe managedcertificate gemini-live-cert -n gemini-live
+# Check Gateway and TLS status
+kubectl describe gateway gemini-live-gateway -n gemini-live
+gcloud certificate-manager certificates describe gemini-live-cert --project=YOUR_PROJECT_ID
 
 # Health check (replace IP/domain)
 curl https://<DOMAIN>/health
@@ -443,10 +444,10 @@ kubectl rollout status deployment/gemini-live-backend -n gemini-live
 |---|---|
 | Pod in `CrashLoopBackOff` | Check logs — missing env vars or Workload Identity not bound |
 | No audio response | Verify `DEMO_AGENT_MODEL`; confirm pod has `roles/aiplatform.user` via Workload Identity |
-| Exotel webhook error | Verify the domain A record and TLS cert are active; check Ingress IP |
+| Exotel webhook error | Verify the domain A record and TLS cert are active; check Gateway status |
 | RAG returns no results | Check `RAG_CORPUS_ID`; ensure corpus has indexed documents |
 | Transcripts not saved | Verify bucket name and `roles/storage.objectAdmin` on the GSA |
-| Call drops mid-conversation | Check `sessionAffinity: ClientIP` is set; check BackendConfig `timeoutSec: 3600` |
+| Call drops mid-conversation | Check `sessionAffinity: CLIENT_IP` in GCPBackendPolicy; check `timeoutSec: 3600` |
 | TLS cert not provisioning | DNS A record may not have propagated; can take up to 60 min |
 | Cold start on first call | Ensure HPA `minReplicas: 1`; pod should always be running |
 | `gke-gcloud-auth-plugin` not found / not executable | Standalone SDK: `gcloud components install gke-gcloud-auth-plugin`. Apt/Debian/Ubuntu: `sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin`. Then re-run deploy.sh |

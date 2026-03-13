@@ -1,0 +1,140 @@
+# GKE Gateway API — replaces the old k8s/ingress.yaml (Ingress + ManagedCertificate
+# + FrontendConfig) with the future-proof Gateway API.
+#
+# Uses gke-l7-global-external-managed GatewayClass which provisions a GCP Global
+# External HTTP(S) Load Balancer — same LB type as the old Ingress, managed via
+# the Gateway API (the Kubernetes-recommended successor to Ingress).
+#
+# Resources in this file:
+#   GCPBackendPolicy  — backend timeout + connection draining + session affinity
+#                        (replaces BackendConfig from service.yaml)
+#   Gateway           — binds global static IP + TLS cert map, opens ports 80+443
+#   HTTPRoute (https) — routes HTTPS/WSS traffic → gemini-live-backend Service
+#   HTTPRoute (http)  — redirects plain HTTP → HTTPS (301)
+#
+# Placeholders (substituted by deploy.sh):
+#   REPLACE_WITH_STATIC_IP_NAME — global static IP resource name (e.g. gemini-live-ip)
+#   REPLACE_WITH_CERT_MAP_NAME  — Certificate Manager cert map name
+#   REPLACE_WITH_DOMAIN         — your custom domain (e.g. api.example.com)
+#
+# Prerequisites:
+#   1. Global static IP reserved (Terraform: google_compute_global_address)
+#   2. Certificate Manager cert + map created (Terraform or deploy.sh)
+#   3. DNS A record: DOMAIN → static IP (must resolve before cert provisions)
+#
+# Monitoring cert status:
+#   gcloud certificate-manager certificates describe gemini-live-cert \
+#     --project=PROJECT_ID
+
+---
+# GCPBackendPolicy — Gateway API equivalent of the Ingress BackendConfig.
+#
+# timeoutSec: 3600 — Exotel voice calls can last up to 60 min; the default
+#   GCP LB backend timeout of 30 s would terminate active WebSocket sessions.
+#
+# connectionDraining: 600 s — allows in-flight calls to finish before a pod
+#   is removed during rolling updates or scale-down events.
+#
+# sessionAffinity: CLIENT_IP — WebSocket sessions are stateful; the active
+#   connection to the Gemini Live API and per-call audio state live in a
+#   single pod. Client IP affinity pins all requests from the same caller
+#   to the same pod, preventing state loss if load is rebalanced mid-call
+#   (Gemini Live Bible §4.2.1).
+#
+# Note: with GKE Gateway + NEG-based routing, traffic bypasses kube-proxy,
+# so Service-level sessionAffinity has no effect. This GCPBackendPolicy is
+# what actually enforces stickiness at the load balancer level.
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: gemini-live-backend-policy
+  namespace: gemini-live
+spec:
+  default:
+    timeoutSec: 3600
+    connectionDraining:
+      drainingTimeoutSec: 600
+    sessionAffinity:
+      type: CLIENT_IP
+  targetRef:
+    group: ""
+    kind: Service
+    name: gemini-live-backend
+    port: 80
+
+---
+# Gateway — provisions a GCP Global External HTTP(S) Load Balancer.
+#
+# - Binds the reserved global static IP so the LB address never changes.
+# - certmap annotation attaches the Certificate Manager cert map for TLS
+#   (replaces ManagedCertificate used with the old Ingress).
+# - Opens port 443 (HTTPS/WSS) and port 80 (HTTP, for redirect only).
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gemini-live-gateway
+  namespace: gemini-live
+  annotations:
+    # Certificate Manager cert map — must exist before Gateway is created.
+    # Provisioned by Terraform (google_certificate_manager_certificate_map)
+    # or by deploy.sh (gcloud certificate-manager maps create).
+    networking.gke.io/certmap: REPLACE_WITH_CERT_MAP_NAME
+spec:
+  gatewayClassName: gke-l7-global-external-managed
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+  addresses:
+    - type: NamedAddress
+      value: REPLACE_WITH_STATIC_IP_NAME
+
+---
+# HTTPRoute (HTTPS) — forwards all HTTPS/WSS traffic to the backend service.
+# Both regular HTTP requests and WebSocket Upgrade requests use the same route;
+# GKE's Global LB handles WebSocket upgrades transparently.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: gemini-live-route
+  namespace: gemini-live
+spec:
+  parentRefs:
+    - name: gemini-live-gateway
+      sectionName: https
+  hostnames:
+    - REPLACE_WITH_DOMAIN
+  rules:
+    - backendRefs:
+        - name: gemini-live-backend
+          port: 80
+
+---
+# HTTPRoute (HTTP redirect) — 301 redirect from plain HTTP → HTTPS.
+# Replaces the FrontendConfig + redirectToHttps used with the old Ingress.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: gemini-live-http-redirect
+  namespace: gemini-live
+spec:
+  parentRefs:
+    - name: gemini-live-gateway
+      sectionName: http
+  hostnames:
+    - REPLACE_WITH_DOMAIN
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301

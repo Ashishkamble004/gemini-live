@@ -48,7 +48,7 @@ variable "agent_model" {
 }
 
 variable "domain" {
-  description = "Custom domain for HTTPS Ingress + managed TLS cert (leave empty to use the static IP only)"
+  description = "Custom domain for HTTPS Gateway + managed TLS cert (leave empty to use the static IP only)"
   type        = string
   default     = ""
 }
@@ -72,7 +72,7 @@ variable "ksa_name" {
 }
 
 variable "static_ip_name" {
-  description = "Name for the global static IP address reserved for the GKE Ingress"
+  description = "Name for the global static IP address reserved for the GKE Gateway load balancer"
   type        = string
   default     = "gemini-live-ip"
 }

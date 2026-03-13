@@ -7,7 +7,8 @@
 #   • GCP service account + IAM bindings (Vertex AI, GCS, Workload Identity)
 #   • Cloud Build SA permissions (GCR push + GKE rolling update)
 #   • GCS bucket for call transcripts
-#   • Global static IP for GKE Ingress
+#   • Global static IP for GKE Gateway load balancer
+#   • Certificate Manager certificate, cert map & entry (when domain is set)
 #   • GKE Autopilot cluster (optional custom VPC / subnetwork)
 #   • Workload Identity KSA → GSA binding
 #
@@ -62,6 +63,7 @@ locals {
     "containerregistry.googleapis.com",
     "iam.googleapis.com",
     "compute.googleapis.com",
+    "certificatemanager.googleapis.com",
   ]
 }
 
@@ -158,14 +160,59 @@ resource "google_storage_bucket" "transcripts" {
 }
 
 # ---------------------------------------------------------------------------
-# Global static IP — GKE Ingress load balancer
+# Global static IP — GKE Gateway load balancer
 # ---------------------------------------------------------------------------
 
+# Note: resource is named "ingress_ip" for backwards compatibility with
+# existing Terraform state. Renaming would destroy and recreate the IP,
+# releasing the static address and breaking DNS.
 resource "google_compute_global_address" "ingress_ip" {
   name    = var.static_ip_name
   project = var.project_id
 
   depends_on = [google_project_service.apis]
+}
+
+# ---------------------------------------------------------------------------
+# Certificate Manager — TLS for GKE Gateway (replaces ManagedCertificate)
+#
+# Only created when var.domain is set. Uses load-balancer-based domain
+# validation — the cert will provision once the DNS A record points to
+# the global static IP and the Gateway is created.
+# ---------------------------------------------------------------------------
+
+resource "google_certificate_manager_certificate" "default" {
+  count   = var.domain != "" ? 1 : 0
+  name    = "gemini-live-cert"
+  project = var.project_id
+
+  managed {
+    domains = [var.domain]
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_certificate_manager_certificate_map" "default" {
+  count   = var.domain != "" ? 1 : 0
+  name    = "gemini-live-cert-map"
+  project = var.project_id
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_certificate_manager_certificate_map_entry" "default" {
+  count        = var.domain != "" ? 1 : 0
+  name         = "gemini-live-cert-entry"
+  project      = var.project_id
+  map          = google_certificate_manager_certificate_map.default[0].name
+  certificates = [google_certificate_manager_certificate.default[0].id]
+  hostname     = var.domain
+
+  depends_on = [
+    google_certificate_manager_certificate_map.default,
+    google_certificate_manager_certificate.default,
+  ]
 }
 
 # ---------------------------------------------------------------------------

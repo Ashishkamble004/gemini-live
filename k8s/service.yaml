@@ -1,20 +1,16 @@
 # Service for the Gemini Live backend.
 #
-# type: NodePort — traffic arrives via the GKE HTTP(S) Ingress (ingress.yaml),
+# type: NodePort — traffic arrives via the GKE Gateway (gateway.yaml),
 # which terminates TLS and forwards to this Service over HTTP.
 #
-# sessionAffinity: ClientIP — Gemini Live API Best Practice (go/gemini-live-bible §4.2.1):
-#   WebSocket sessions are stateful; the active connection to the Gemini Live
-#   API and per-call audio state live in a single pod. ClientIP affinity pins
-#   all requests from the same caller to the same pod, preventing state loss
-#   if load is rebalanced mid-call.
+# sessionAffinity: ClientIP — kept for direct Service access (e.g. kubectl
+# port-forward). For Gateway-routed traffic, session affinity is enforced
+# at the load balancer level by GCPBackendPolicy in gateway.yaml.
 #
-# Annotations:
-#   backend-config  — references BackendConfig below, which sets the
-#                     3600 s backend timeout required for long voice calls
-#                     (standard GCP HTTPS LB default is 30 s).
-#   neg             — enables container-native load balancing so the LB
-#                     routes directly to pod IPs, bypassing kube-proxy.
+# Note: the BackendConfig + cloud.google.com/backend-config annotation
+# previously used with the Ingress have been replaced by GCPBackendPolicy
+# in gateway.yaml; the cloud.google.com/neg annotation for Ingress NEGs
+# is no longer needed since the Gateway controller creates NEGs automatically.
 apiVersion: v1
 kind: Service
 metadata:
@@ -22,9 +18,6 @@ metadata:
   namespace: gemini-live
   labels:
     app: gemini-live-backend
-  annotations:
-    cloud.google.com/backend-config: '{"default": "gemini-live-backendconfig"}'
-    cloud.google.com/neg: '{"ingress": true}'
 spec:
   type: NodePort
   selector:
@@ -35,23 +28,10 @@ spec:
       targetPort: 8080
       protocol: TCP
   # Pin requests from the same caller IP to the same pod for the duration of
-  # a call. Critical for WebSocket connection stability (Gemini Live Bible).
+  # a call. Effective for direct Service access; for Gateway-routed traffic,
+  # GCPBackendPolicy (gateway.yaml) handles this at the LB level.
   sessionAffinity: ClientIP
   sessionAffinityConfig:
     clientIP:
       # 3600 s matches the maximum supported call duration.
       timeoutSeconds: 3600
-
----
-# BackendConfig — sets the HTTP backend timeout to 3600 s so that long
-# voice calls are not terminated by the GCP load balancer's default 30 s
-# idle timeout. Also configures connection draining for graceful shutdowns.
-apiVersion: cloud.google.com/v1
-kind: BackendConfig
-metadata:
-  name: gemini-live-backendconfig
-  namespace: gemini-live
-spec:
-  timeoutSec: 3600
-  connectionDraining:
-    drainingTimeoutSec: 600

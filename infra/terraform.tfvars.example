@@ -20,7 +20,7 @@ cluster_name = "gemini-live-cluster"
 agent_model  = "gemini-live-2.5-flash-native-audio"
 
 # Leave domain empty to use the static IP directly (no TLS cert provisioned).
-# Set to your FQDN to enable Google-managed TLS on the GKE Ingress.
+# Set to your FQDN to enable Google-managed TLS on the GKE Gateway.
 domain = ""   # e.g. "ak-demos.com"
 
 # ── Networking — leave as "default" to use the project default VPC ────────────

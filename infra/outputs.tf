@@ -4,12 +4,12 @@
 # =============================================================================
 
 output "static_ip_address" {
-  description = "Global static IP reserved for the GKE Ingress load balancer"
+  description = "Global static IP reserved for the GKE Gateway load balancer"
   value       = google_compute_global_address.ingress_ip.address
 }
 
 output "static_ip_name" {
-  description = "Resource name of the global static IP (referenced in k8s/ingress.yaml)"
+  description = "Resource name of the global static IP (referenced in k8s/gateway.yaml)"
   value       = google_compute_global_address.ingress_ip.name
 }
 
@@ -31,6 +31,11 @@ output "backend_sa_email" {
 output "gcs_bucket_name" {
   description = "GCS bucket for call transcripts"
   value       = google_storage_bucket.transcripts.name
+}
+
+output "cert_map_name" {
+  description = "Certificate Manager certificate map name (referenced in k8s/gateway.yaml)"
+  value       = var.domain != "" ? google_certificate_manager_certificate_map.default[0].name : ""
 }
 
 output "backend_ws_url" {

@@ -15,14 +15,15 @@
 #   3. Grant required IAM roles to the service account
 #   4. Grant the Cloud Build SA permissions to build and update GKE workloads
 #   5. Create the GCS transcript bucket if it does not exist
-#   6. Reserve a global static IP for the Ingress
+#   6. Reserve a global static IP for the Gateway load balancer
 #   7. Create a GKE Autopilot cluster if it does not exist
 #   8. Configure Workload Identity (bind KSA to GSA)
 #   9. Build the container image with Cloud Build and push to GCR
-#  10. Apply all Kubernetes manifests (namespace, SA, configmap, deployment,
-#      service, ingress) with project-specific values substituted
-#  11. Wait for the Deployment rollout to complete
-#  12. Set BACKEND_WS_URL in the ConfigMap and restart the Deployment
+#  10. Provision Certificate Manager cert + map (if domain is set)
+#  11. Apply all Kubernetes manifests (namespace, SA, configmap, deployment,
+#      service, gateway) with project-specific values substituted
+#  12. Wait for the Deployment rollout to complete
+#  13. Set BACKEND_WS_URL in the ConfigMap and restart the Deployment
 # =============================================================================
 
 set -euo pipefail
@@ -158,6 +159,7 @@ gcloud services enable \
   containerregistry.googleapis.com \
   iam.googleapis.com \
   compute.googleapis.com \
+  certificatemanager.googleapis.com \
   --project="$PROJECT_ID" --quiet
 info "APIs enabled"
 
@@ -345,20 +347,63 @@ info "ConfigMap applied"
 sed "s|YOUR_PROJECT_ID|${PROJECT_ID}|g" k8s/deployment.yaml | kubectl apply --validate=false -f -
 info "Deployment + HPA applied"
 
-# 5. Service + BackendConfig
+# 5. Service
 kubectl apply --validate=false -f k8s/service.yaml
-info "Service + BackendConfig applied"
+info "Service applied"
 
-# 6. Ingress (with ManagedCertificate + FrontendConfig)
+# 6. GCPBackendPolicy + Gateway + HTTPRoutes (replaces Ingress + BackendConfig + FrontendConfig)
 if [[ -n "${DOMAIN}" ]]; then
+  # ── Certificate Manager (replaces ManagedCertificate) ──────────────────
+  step "Certificate Manager: ${DOMAIN}"
+
+  if gcloud certificate-manager certificates describe gemini-live-cert \
+      --project="${PROJECT_ID}" &>/dev/null 2>&1; then
+    info "Certificate already exists"
+  else
+    gcloud certificate-manager certificates create gemini-live-cert \
+      --domains="${DOMAIN}" \
+      --project="${PROJECT_ID}" \
+      --quiet
+    info "Certificate created"
+  fi
+
+  if gcloud certificate-manager maps describe gemini-live-cert-map \
+      --project="${PROJECT_ID}" &>/dev/null 2>&1; then
+    info "Certificate map already exists"
+  else
+    gcloud certificate-manager maps create gemini-live-cert-map \
+      --project="${PROJECT_ID}" \
+      --quiet
+    info "Certificate map created"
+  fi
+
+  if gcloud certificate-manager maps entries describe gemini-live-cert-entry \
+      --map=gemini-live-cert-map \
+      --project="${PROJECT_ID}" &>/dev/null 2>&1; then
+    info "Certificate map entry already exists"
+  else
+    gcloud certificate-manager maps entries create gemini-live-cert-entry \
+      --map=gemini-live-cert-map \
+      --certificates=gemini-live-cert \
+      --hostname="${DOMAIN}" \
+      --project="${PROJECT_ID}" \
+      --quiet
+    info "Certificate map entry created"
+  fi
+
+  # ── Apply Gateway manifests ────────────────────────────────────────────
+  step "Applying Gateway + HTTPRoutes + GCPBackendPolicy"
+
   sed -e "s|REPLACE_WITH_DOMAIN|${DOMAIN}|g" \
       -e "s|REPLACE_WITH_STATIC_IP_NAME|${STATIC_IP_NAME}|g" \
-      k8s/ingress.yaml | kubectl apply --validate=false -f -
-  info "Ingress + ManagedCertificate applied"
+      -e "s|REPLACE_WITH_CERT_MAP_NAME|gemini-live-cert-map|g" \
+      k8s/gateway.yaml | kubectl apply --validate=false -f -
+  info "Gateway + HTTPRoutes + GCPBackendPolicy applied"
   warn "DNS: create an A record pointing ${DOMAIN} → ${_STATIC_IP}"
-  warn "TLS cert provisioning takes 15–60 min after DNS propagation."
+  warn "TLS cert provisioning begins after DNS A record propagates."
+  warn "Monitor: gcloud certificate-manager certificates describe gemini-live-cert --project=${PROJECT_ID}"
 else
-  warn "No domain provided — skipping Ingress/TLS. You must set BACKEND_WS_URL manually."
+  warn "No domain provided — skipping Gateway/TLS. You must set BACKEND_WS_URL manually."
   warn "To add TLS later, re-run: ./deploy.sh and provide a domain."
 fi
 
