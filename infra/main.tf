@@ -193,6 +193,14 @@ resource "google_container_cluster" "main" {
     channel = "REGULAR"
   }
 
+  # Enable DNS endpoint with external traffic so kubectl works from outside
+  # the VPC (e.g. Cloud Shell, local machine) without a VPN or bastion.
+  control_plane_endpoints_config {
+    dns_endpoint_config {
+      allow_external_traffic = true
+    }
+  }
+
   # Allow terraform destroy to delete the cluster
   deletion_protection = false
 
